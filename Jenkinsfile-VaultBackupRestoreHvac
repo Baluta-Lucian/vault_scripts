@@ -1,0 +1,376 @@
+@Library('your-library')_(if needed)
+
+// some global configs...
+def instanceConfig
+def instanceConfigString
+def clusterValuesPath
+
+pipeline {
+    agent {
+        node {
+            label "your_node_label"
+        }
+    }
+
+    parameters {
+        string(name: 'Justification', defaultValue: 'Misconfiguration/Accidental deletion of secrets', description: 'Task or project which requires vault-backup restoration.')
+        booleanParam(name: 'MANUAL_ROLLOUT', defaultValue: false, description: 'Set this variable if you wish to manually restore the Vault backup in exceptional cases.')
+        string(name: 'VAULT_ADDRESS', defaultValue: 'you_vault_addr_default_value', description: 'Vault instance to be used primarily.')
+    }
+
+    environment {
+        NAME                     ="${params.NAME}"
+        CLUSTERNAME              ="${params.CLUSTERNAME}"
+        MSG                      ="${params.Justification}"
+        VAULT_ADDR               ="${params.VAULT_ADDRESS}"
+        MANUAL_ROLLOUT           = "${params.MANUAL_ROLLOUT ? 'true' : 'false'}"
+        VAULT_MOUNT_PATH         ='your_mount_path'
+        VAULT_SECRET_PATHS       ="your_secrets_paths" # in case of directory structures inside secrets-engine
+        HVAC_VAULT_SECRET_PATH   ='your_vault_hvac_encryption_keys'
+        STORAGE_USER             ='your_storage_user'
+        ES_HM_USER               ='your_vault_write_auth'
+        ES_HM_HOST_URL           ='yout_hm_host_url'
+        ES_HM_INDEX              ='vault_approvalhandling_logs'
+    }
+
+    stages {
+
+        stage('Get instance configuration') {
+            steps {
+                script {
+                    instanceConfig = getClusterConfig(cluster: params.CLUSTERNAME)
+                    if (instanceConfig == null) {
+                        error("Unable to fetch instance configs")
+                    }
+                    if(instanceConfig.cloud.project == 'your_project' || instanceConfig.cloud.project == 'your_second_project') {
+                        if (env.GIT_BRANCH != 'origin/master' && params.NOT_MASTER.toBoolean() == false) {
+                            println("Your branch + parameter is not set")
+                            currentBuild.result = 'ABORTED'
+                            error("Aborting the build")
+                        }  else {
+                            sendNotificationNewWay ("STARTED", instanceConfig)
+                        }
+                    } else {
+                        sendNotificationNewWay("STARTED", instanceConfig)
+                    }
+                    //Get Timestamp
+                    def timestamp = new Date().format("yyyy-MM-dd'T'HH:mm:ss.SSSXXX")
+                    env.START_TIME = timestamp
+
+                    // Set environment variables to run the script on the Jenkins instance
+                    instanceConfigString = writeJSON returnText: true, json: instanceConfig
+                    def cloudConfig = instanceConfig.cloud  
+                    if (cloudConfig) {
+                        env.DOMAIN = cloudConfig.domain
+                        env.REGION = cloudConfig.region
+                        env.PROJECT = cloudConfig.project
+                    }
+                }
+            }
+        }
+
+        stage('Get Container Account') { 
+            #Remove due to internal use cases, modify with your get container account process      
+}
+
+        stage('Notification') {
+            steps {
+                script {
+                    //Fetch buid user details
+                    def (user_name, user_id) = [currentBuild.getBuildCauses()[0]?.userName, currentBuild.getBuildCauses()[0]?.userId]
+                    env.USER = "${user_name}"
+                    env.USER_ID = "${user_id}"
+                    env.BUILD_STATUS = "Triggered"
+
+                    try {
+                        withCredentials([
+                            [$class: 'your_credentials_binding_class', credentialsId: 'your_credentials_id', vaultAddr: params.VAULT_ADDRESS]
+                        ]) {
+                            def scriptOutput = sh(
+                                script: "python3 vaultbackup_restore_hvac.py --send_report 2>&1",
+                                returnStdout: true
+                            ).trim()
+                            echo "${scriptOutput}"
+
+                            // Check if there was an error in the script output
+                            if (scriptOutput.contains('ERROR')) {
+                                error " Error in script execution, Job failed. Output: ${scriptOutput}"
+                            }
+                            echo "Vault-backup restore workflow logs forwarded to Healthmon succesfully."
+                        }
+                    } catch (Exception e) {
+                        error "Failure in forwarding logs to Healthmon processing, Error: ${e.message}"
+                    }
+                }
+            }
+        }
+
+        stage('Await Approval') {
+            steps {
+                script {
+                    sendSlackApproval() #modify with your send approval function
+                    def approvers = [
+			#def your approvals
+                    ]
+
+                    timeout(time: 120, unit: 'MINUTES') {
+                        def inputParams = input(
+                            id: 'UserApproval',
+                            message: "Do you allow Hvac backup restore?",
+                            parameters: [
+                                choice(name: 'Approval', choices: ['Approve', 'Reject'], description: 'Select Approve or Reject'),
+                                string(name: 'Reason', defaultValue: '', description: 'Provide a reason if rejecting')
+                            ],
+                            submitter: approvers.keySet().join(','),
+                            submitterParameter: 'approver'
+                        )
+
+                        def approver = inputParams['approver']
+                        def approvalStatus = inputParams['Approval']
+                        def rejectionReason = inputParams['Reason']
+
+                        // Check if the approver is in the allowed list
+                        def matchedApprover = approvers.keySet().find { it.equalsIgnoreCase(approver) }
+
+                        if (!matchedApprover) {
+                            env.APPROVER = "${approver}"
+                            env.ERROR = "Approval aborted. User ${approver} is not allowed to approve. Exiting."
+                            error(env.ERROR)
+                        }
+
+                        env.APPROVER = "${approvers[matchedApprover]}"
+                        env.APPROVER_ID = "${approver}"
+                        if (approvalStatus == 'Reject') {
+                            env.RE_MSG = rejectionReason ?: "No reason provided"
+                            env.ERROR = "Approval rejected by ${env.APPROVER},Reason: ${env.RE_MSG}."
+                            error(env.ERROR)
+                        } else {
+                            echo "Approval received from: ${env.APPROVER}"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Retrieve Backup List') {
+            steps {
+                script {
+                    try {
+                        withCredentials([
+                            [$class: 'your_vault_credentials_binding_class', credentialsId: 'your_vault_read_only_credentials_id', vaultAddr: params.VAULT_ADDRESS]
+                        ]) {
+                            def scriptOutput = sh(
+                                script: "python3 vaultbackup_restore_hvac.py --list_backups 2>&1",
+                                returnStdout: true
+                            ).trim()
+    
+                            echo "${scriptOutput}"
+    
+                            // Check if there was an error in the script output
+                            if (scriptOutput.contains('ERROR')) {
+                                error " Error in script execution, Job failed. Output: ${scriptOutput}"
+                            }
+    
+                            // Extract JSON part using regex
+                            def jsonString = scriptOutput.find(/\{.*\}/)
+                            if (!jsonString) {
+                                error "Failed to extract JSON backup list from script output."
+                            }
+    
+                            // Parse JSON output
+                            def backupData = readJSON text: jsonString
+    
+                            // Extract backup lists safely
+                            def your_directory_1_backup = backupData.backups_list?.get("your-secrets-engine-name_directory-1-name") ?: []
+                            def your_directory_2_backup = backupData.backups_list?.get("our-secrets-engine-name_directory-2-name") ?: []
+    
+                            // Set environment variables
+                            env.YOUR_DIRECTORY_1_BACKUP_LIST = directory1Backups.join("\n")
+                            env.YOUR_DIRECTORY_2_BACKUP_LIST = directory2Backups.join("\n")
+    
+                            if (!env.YOUR_DIRECTORY_1_BACKUP_LIST || !env.YOUR_DIRECTORY_2_BACKUP_LIST) {
+                                error "Error: Backup list extraction failed, one or both lists are empty!"
+                            }
+                        }
+                    } catch (Exception e) {
+                        error "General failure in processing backup file lists: ${e.message}"
+                    }
+                }
+            }
+        }
+
+        stage('Input Selection - YOUR_DIRECTORY_1 Backup') {
+            steps {
+                script {
+                    try {
+                        def selectedDirectory1Backup = input(
+                            message: "Select an Directory1 vault backup file for restoration (timeout in 5 min)",
+                            submitter: env.USER_ID,
+                            parameters: [
+                                choice(
+                                    name: "DIRECTORY_1_BACKUP_FILE", 
+                                    choices: env.YOUR_DIRECTORY_1_BACKUP_LIST
+                                )
+                            ]
+                        )
+
+                        env.SELECTED_DIRECTORY1_BACKUP = selectedDirectory1Backup
+                        echo "User selected Directory1 vault-backup file: ${env.SELECTED_DIRECTORY1_BACKUP}"
+                    } catch (org.jenkinsci.plugins.workflow.steps.FlowInterruptedException flowExc) {
+                        def result = flowExc.getResult().toString()
+                        error "User rejected the input request on backup file selection."
+                    } catch (err) {
+                        error "Unexpected error occurred: ${err}" 
+                    }
+                    
+                }
+            }
+        }
+
+        stage('Input Selection - Directory2 Backup') {
+            steps {
+                script {
+                    try {
+                        def selectedDirectory2Backup = input(
+                            message: "Select an Directory2 vault-backup file for restoration (timeout in 5 min)",
+                            submitter: env.USER_ID,
+                            parameters: [
+                                choice(
+                                    name: "DIRECTORY_2_BACKUP_FILE", 
+                                    choices: env.YOUR_DIRECTORY_2_BACKUP_LIST 
+                                )
+                            ]
+                        )
+
+                        env.SELECTED_DIRECTORY_2_BACKUP = selectedDirectory2Backup
+                        echo "User selected Directory2 vault-backup file: ${env.SELECTED_DIRECTORY_2_BACKUP}"
+                    } catch (org.jenkinsci.plugins.workflow.steps.FlowInterruptedException flowExc) {
+                        def result = flowExc.getResult().toString()
+                        error "User rejected the input request on backup file selection."
+                    } catch (err) {
+                        error "Unexpected error occurred: ${err}" 
+                    }
+                }
+            }
+        }
+
+        stage('Download files') {
+            steps {
+                script {
+                    try {
+                        withCredentials([
+                            [$class: 'your_vault_credentials_binding_class', credentialsId: 'your_vault_read_only_credentials_id', vaultAddr: params.VAULT_ADDRESS]
+                        ]) {
+                            def scriptOutput = sh(
+                                script: "python3 vaultbackup_restore_hvac.py --fetch_files 2>&1",
+                                returnStdout: true
+                            ).trim()
+    
+                            echo "${scriptOutput}"
+    
+                            // Check if there was an error in the script output
+                            if (scriptOutput.contains('ERROR')) {
+                                error " Error in script execution, Job failed. Output: ${scriptOutput}"
+                            }
+                            // Parse JSON output
+                            def jsonString = scriptOutput.find(/\{.*\}/)
+                            def jsonOutput = readJSON text: jsonString
+                            def filePaths = jsonOutput.backup_files_path.join(',')
+
+                            // Set the environment variable
+                            env.BACKUP_FILE_PATHS = filePaths
+                            echo "Vault-backup file versions are downloaded successfully."
+                        }
+                    } catch (Exception e) {
+                        error "Failure in downloading backup file versions, Error: ${e.message}"
+                    }
+                }
+            }
+        }
+
+        stage('Hvac Vault-backup Restore') {
+            steps {
+                script {
+                    try {
+                        withCredentials([
+                            [$class: 'your_vault_credentials_binding_class', credentialsId: 'your_vault_write_credentials_id', vaultAddr: params.VAULT_ADDRESS]
+                        ]) {
+                            def scriptOutput = sh(
+                                script: "python3 vaultbackup_restore_hvac.py --backup_restore 2>&1",
+                                returnStdout: true
+                            ).trim()
+    
+                            echo "${scriptOutput}"
+    
+                            // Check if there was an error in the script output
+                            if (scriptOutput.contains('ERROR')) {
+                                error " Error in script execution, Job failed. Output: ${scriptOutput}"
+                            }
+                            echo "Hvac Vault-backup restoration is Success."
+                        }
+                    } catch (Exception e) {
+                        error "Failure in Hvac Vault-backup restore processing, Error: ${e.message}"
+                    }
+                }
+            }
+        }
+
+        stage('Sync Vaults') {
+            steps {
+                build job: "vault-synchronisation", wait: true #use if you have multiple vaults to sync
+            }
+        }
+    }
+
+    post {
+        // Forward workflow access logs to Monitoring
+        always {
+            script {
+                env.BUILD_STATUS = currentBuild.result
+                try {
+                    withCredentials([
+                        [$class: 'your_vault_credentials_binding_class', credentialsId: 'your_vault_read_only_credentials_id', vaultAddr: params.VAULT_ADDRESS]
+                    ]) {
+                        def scriptOutput = sh(
+                            script: "python3 vaultbackup_restore_hvac.py --send_report 2>&1",
+                            returnStdout: true
+                        ).trim()
+                        echo "${scriptOutput}"
+
+                        // Check if there was an error in the script output
+                        if (scriptOutput.contains('ERROR')) {
+                            error " Error in script execution, Job failed. Output: ${scriptOutput}"
+                        }
+                        echo "Vault-backup restore workflow logs forwarded to Monitoring succesfully."
+                    }
+                } catch (Exception e) {
+                    error "Failure in forwarding logs to Monitoring processing, Error: ${e.message}"
+                }
+            }
+        }
+
+        cleanup {
+            deleteDir()
+        }
+
+        success {
+            script {
+                currentBuild.result = 'SUCCESS'
+                slackSend channel: '#your_slack_devops_duty_channel', color: 'good', message: "Hvac Vault-backup restoration completed successfully.: ${currentBuild.result} [ #${env.BUILD_NUMBER} ${env.BUILD_URL} ]"
+            }
+        }
+        failure {
+            script {
+                currentBuild.result = 'FAILURE'
+                slackSend channel: '#your_slack_devops_duty_channel', color: 'danger', message: "Hvac Vault-backup restoration failed. Please check. Status: ${currentBuild.result} [ #${env.BUILD_NUMBER} ${env.BUILD_URL} ]"
+            }
+        }
+        aborted {
+            script {
+                currentBuild.result = 'ABORTED'
+                slackSend channel: '#your_slack_devops_duty_channel', color: 'warning', message: "Hvac Vault-backup restoration workflow aborted due to timeout/approval rejection, Please check. Status: ${currentBuild.result} [ #${env.BUILD_NUMBER} ${env.BUILD_URL} ]"
+            }
+        }
+    }
+
+}
